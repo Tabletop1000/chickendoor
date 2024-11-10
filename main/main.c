@@ -15,6 +15,8 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "freertos/semphr.h"
+#include "driver/gptimer.h"
+#include "esp_log.h"
 
 /**
  * Brief:
@@ -36,6 +38,8 @@
  *
  */
 
+static const char *TAG = "chickendoor";
+
 #define STEPPER_OUTPUT_A    4
 #define STEPPER_OUTPUT_B    16
 #define STEPPER_OUTPUT_C    12
@@ -49,6 +53,8 @@
 #define GPIO_SW_PIN_SEL  ((1ULL<<GPIO_SW_UPPER) | (1ULL<<GPIO_SW_LOWER) | (1ULL<<GPIO_SW_CTL_A) | (1ULL<<GPIO_SW_CTL_B))
 
 SemaphoreHandle_t xSemaphore = NULL;
+
+static QueueHandle_t gpio_evt_queue = NULL;
 
 /* Program State */
 static struct machine_state {
@@ -66,6 +72,18 @@ static struct machine_state state = {
     .controller = CTRL_UNKNOWN,
     .active_state = STATE_UNKNOWN,
 };
+
+static bool IRAM_ATTR example_timer_on_alram_cb_v1(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    QueueHandle_t queue = (QueueHandle_t)user_data;
+    // stop timer immediately
+    gptimer_stop(timer);
+    // Retrieve count value and send to queue
+    printf("Timer triggered\n");
+    // return whether we need to yield at the end of ISR
+    return (high_task_awoken == pdTRUE);
+}
 
 /* Task function declarations */
 static void task_RunMotor(void* arg);
@@ -107,6 +125,16 @@ void motor_stop(void)
     gpio_set_level(STEPPER_OUTPUT_A, 0);
 }
 
+static void activate_motor()
+{
+    printf("activate motor\n");
+}
+
+static void deactivate_motor()
+{
+    printf("deactivate motor\n");
+}
+
 static void task_RunMotor(void* arg)
 {
     uint16_t motor_delay = 10;
@@ -138,7 +166,6 @@ static void task_RunMotor(void* arg)
 static void task_ReadSwitches(void* arg)
 {
     printf("Starting ReadSwitches() task...\n");
-    for(;;){
         // Check upper limit switch
         uint8_t upper_sw_status = gpio_get_level(GPIO_SW_UPPER);
         uint8_t lower_sw_status = gpio_get_level(GPIO_SW_LOWER);
@@ -154,8 +181,6 @@ static void task_ReadSwitches(void* arg)
             //if((control_sw_B == 1) && (control_sw_B == 1))state.controller = CTRL_AUTO;
             xSemaphoreGive(xSemaphore);
         }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
 }
 
 void print_state(struct machine_state* s)
@@ -184,8 +209,6 @@ static void task_ExecuteStateMachine(void* arg)
 {
     printf("Starting State Machine...\n");
     struct machine_state local_state;
-    for(;;)
-    {
         // Get state
         if(xSemaphoreTake(xSemaphore,100/portTICK_PERIOD_MS)) {
             local_state = state;
@@ -198,8 +221,6 @@ static void task_ExecuteStateMachine(void* arg)
             print_state(&state);
             xSemaphoreGive(xSemaphore);
         }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
 }
 
 static void manualStateMachine(struct machine_state *s)
@@ -208,7 +229,7 @@ static void manualStateMachine(struct machine_state *s)
     {
         case STATE_OPEN:
         if(s->controller == CTRL_LOWER)s->active_state = STATE_CLOSING;
-        break;
+            break;
 
         case STATE_CLOSING:
         {
@@ -219,7 +240,7 @@ static void manualStateMachine(struct machine_state *s)
 
         case STATE_CLOSED:
         if(s->controller == CTRL_RAISE)s->active_state = STATE_OPENING;
-        break;
+            break;
 
         case STATE_OPENING:
         {
@@ -233,10 +254,42 @@ static void manualStateMachine(struct machine_state *s)
     }
 }
 
-static void IRAM_ATTR gpio_isr_handler(void* arg)
+static void gpio_isr_handler(void* arg)
 {
     uint32_t gpio_num = (uint32_t) arg;
-    printf("arg: %ld\n",gpio_num);
+    gpio_intr_disable(GPIO_SW_CTL_A);
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+static void gpio_task_example(void* arg)
+{
+    uint32_t io_num;
+    for (;;) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            gpio_intr_enable(GPIO_SW_CTL_A);
+            printf("GPIO[%"PRIu32"] intr, val: %d\n", io_num, gpio_get_level(io_num));
+            task_ReadSwitches(NULL);
+
+            if(state.controller == CTRL_LOWER){
+                activate_motor();
+                while(state.lower_limit_switch){
+                    task_ReadSwitches(NULL);
+                    vTaskDelay(10 / portTICK_PERIOD_MS);
+                }
+                deactivate_motor();
+            }else if(state.controller == CTRL_RAISE){
+                activate_motor();
+                while(state.upper_limit_switch){
+                    task_ReadSwitches(NULL);
+                    vTaskDelay(100/portTICK_PERIOD_MS);
+                }
+                deactivate_motor();
+            }
+
+        }
+
+    }
 }
 
 void app_main(void)
@@ -266,11 +319,41 @@ void app_main(void)
     io_conf.pull_up_en = 1;
     gpio_config(&io_conf);
 
+
+    //create a queue to handle gpio event from isr
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    xTaskCreate(&gpio_task_example, "gpiotask" , 2048, NULL, 5, NULL);
+
     //install gpio isr service
     gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
     //hook isr handler for specific gpio pin
     gpio_isr_handler_add(GPIO_SW_CTL_A, gpio_isr_handler, (void*) GPIO_SW_CTL_A);
-    gpio_isr_handler_add(GPIO_SW_CTL_B, gpio_isr_handler, (void*) GPIO_SW_CTL_B);
+
+    ESP_LOGI(TAG, "Create timer handle");
+    gptimer_handle_t gptimer = NULL;
+    gptimer_config_t timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000, // 1kHz, 1 tick=1ms
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
+
+    gptimer_event_callbacks_t cbs = {
+        .on_alarm = example_timer_on_alram_cb_v1,
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
+
+    ESP_LOGI(TAG, "Enable timer");
+    ESP_ERROR_CHECK(gptimer_enable(gptimer));
+
+    ESP_LOGI(TAG, "Start timer, stop it\n");
+    gptimer_alarm_config_t alarm_config1 = {
+        .alarm_count = 500,
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config1));
+    ESP_ERROR_CHECK(gptimer_start(gptimer));
+
+
 
     printf("Minimum free heap size: %"PRIu32" bytes\n", esp_get_minimum_free_heap_size());
 
@@ -280,7 +363,7 @@ void app_main(void)
         printf("Error creating semaphore\n");
     }
     state.active_state = STATE_OPENING;
-    xTaskCreate(&task_RunMotor, "RunMotor", 2048, NULL, 5, NULL);
-    xTaskCreate(&task_ReadSwitches, "ReadSwitches", 2048, NULL, 5, NULL);
-    xTaskCreate(&task_ExecuteStateMachine, "ExecuteStateMachine", 2048, NULL, 5, NULL);
+    // xTaskCreate(&task_RunMotor, "RunMotor", 2048, NULL, 5, NULL);
+    // xTaskCreate(&task_ReadSwitches, "ReadSwitches", 2048, NULL, 5, NULL);
+    // xTaskCreate(&task_ExecuteStateMachine, "ExecuteStateMachine", 2048, NULL, 5, NULL);
 }
