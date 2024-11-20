@@ -15,7 +15,7 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "freertos/semphr.h"
-#include "driver/gptimer.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 
 /**
@@ -53,6 +53,7 @@ static const char *TAG = "chickendoor";
 #define GPIO_SW_PIN_SEL  ((1ULL<<GPIO_SW_UPPER) | (1ULL<<GPIO_SW_LOWER) | (1ULL<<GPIO_SW_CTL_A) | (1ULL<<GPIO_SW_CTL_B))
 
 SemaphoreHandle_t xSemaphore = NULL;
+esp_timer_handle_t periodic_timer;
 
 static QueueHandle_t gpio_evt_queue = NULL;
 
@@ -73,16 +74,42 @@ static struct machine_state state = {
     .active_state = STATE_UNKNOWN,
 };
 
-static bool IRAM_ATTR example_timer_on_alram_cb_v1(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+void set_stepper_pins(int a, int b, int c, int d)
 {
-    BaseType_t high_task_awoken = pdFALSE;
-    QueueHandle_t queue = (QueueHandle_t)user_data;
-    // stop timer immediately
-    gptimer_stop(timer);
-    // Retrieve count value and send to queue
-    printf("Timer triggered\n");
-    // return whether we need to yield at the end of ISR
-    return (high_task_awoken == pdTRUE);
+    gpio_set_level(STEPPER_OUTPUT_A, a);
+    gpio_set_level(STEPPER_OUTPUT_B, b);
+    gpio_set_level(STEPPER_OUTPUT_C, c);
+    gpio_set_level(STEPPER_OUTPUT_D, d);
+}
+
+static void periodic_timer_callback(void* arg)
+{
+    int64_t time_since_boot = esp_timer_get_time();
+
+    static current_state = 1;
+    if (current_state > 4)current_state = 1;
+    switch(current_state++)
+    {
+        case 1:
+        set_stepper_pins(1,0,0,0);
+        break;
+
+        case 2:
+        set_stepper_pins(0,0,1,0);
+        break;
+
+        case 3:
+        set_stepper_pins(0,1,0,0);
+        break;
+
+        case 4:
+        set_stepper_pins(0,0,0,1);
+        break;
+
+        default: break;
+    }
+    ESP_LOGI(TAG, "Stepper state: %d",current_state);
+
 }
 
 /* Task function declarations */
@@ -101,22 +128,6 @@ void pulse_pin(uint16_t gpio, uint16_t duration_ms)
     gpio_set_level(gpio, 0);
 }
 
-void motor_forward_one_tick(uint16_t motor_delay)
-{
-    pulse_pin(STEPPER_OUTPUT_A, motor_delay);
-    pulse_pin(STEPPER_OUTPUT_C, motor_delay);
-    pulse_pin(STEPPER_OUTPUT_B, motor_delay);
-    pulse_pin(STEPPER_OUTPUT_D, motor_delay);
-}
-
-void motor_reverse_one_tick(uint16_t motor_delay)
-{
-    pulse_pin(STEPPER_OUTPUT_D, motor_delay);
-    pulse_pin(STEPPER_OUTPUT_B, motor_delay);
-    pulse_pin(STEPPER_OUTPUT_C, motor_delay);
-    pulse_pin(STEPPER_OUTPUT_A, motor_delay);
-}
-
 void motor_stop(void)
 {
     gpio_set_level(STEPPER_OUTPUT_D, 0);
@@ -128,11 +139,13 @@ void motor_stop(void)
 static void activate_motor()
 {
     printf("activate motor\n");
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 2000));
 }
 
 static void deactivate_motor()
 {
     printf("deactivate motor\n");
+    ESP_ERROR_CHECK(esp_timer_stop(periodic_timer));
 }
 
 static void task_RunMotor(void* arg)
@@ -294,6 +307,14 @@ static void gpio_task_example(void* arg)
 
 void app_main(void)
 {
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &periodic_timer_callback,
+        .name = "periodic"
+    };
+    
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+
+
     //zero-initialize the config structure.
     gpio_config_t io_conf = {};
     //disable interrupt
@@ -328,32 +349,6 @@ void app_main(void)
     gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
     //hook isr handler for specific gpio pin
     gpio_isr_handler_add(GPIO_SW_CTL_A, gpio_isr_handler, (void*) GPIO_SW_CTL_A);
-
-    ESP_LOGI(TAG, "Create timer handle");
-    gptimer_handle_t gptimer = NULL;
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000, // 1kHz, 1 tick=1ms
-    };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
-
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = example_timer_on_alram_cb_v1,
-    };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
-
-    ESP_LOGI(TAG, "Enable timer");
-    ESP_ERROR_CHECK(gptimer_enable(gptimer));
-
-    ESP_LOGI(TAG, "Start timer, stop it\n");
-    gptimer_alarm_config_t alarm_config1 = {
-        .alarm_count = 500,
-    };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config1));
-    ESP_ERROR_CHECK(gptimer_start(gptimer));
-
-
 
     printf("Minimum free heap size: %"PRIu32" bytes\n", esp_get_minimum_free_heap_size());
 
