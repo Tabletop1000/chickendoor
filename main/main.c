@@ -84,11 +84,17 @@ void set_stepper_pins(int a, int b, int c, int d)
 
 static void periodic_timer_callback(void* arg)
 {
-    int64_t time_since_boot = esp_timer_get_time();
+    static int current_state = 1;
 
-    static current_state = 1;
+    if(state.controller == CTRL_LOWER) {
+        current_state--;
+    }else if (state.controller == CTRL_RAISE) {
+        current_state++;
+    }
     if (current_state > 4)current_state = 1;
-    switch(current_state++)
+    if (current_state < 1)current_state = 4;
+
+    switch(current_state)
     {
         case 1:
         set_stepper_pins(1,0,0,0);
@@ -108,8 +114,6 @@ static void periodic_timer_callback(void* arg)
 
         default: break;
     }
-    ESP_LOGI(TAG, "Stepper state: %d",current_state);
-
 }
 
 /* Task function declarations */
@@ -128,14 +132,6 @@ void pulse_pin(uint16_t gpio, uint16_t duration_ms)
     gpio_set_level(gpio, 0);
 }
 
-void motor_stop(void)
-{
-    gpio_set_level(STEPPER_OUTPUT_D, 0);
-    gpio_set_level(STEPPER_OUTPUT_B, 0);
-    gpio_set_level(STEPPER_OUTPUT_C, 0);
-    gpio_set_level(STEPPER_OUTPUT_A, 0);
-}
-
 static void activate_motor()
 {
     printf("activate motor\n");
@@ -145,55 +141,23 @@ static void activate_motor()
 static void deactivate_motor()
 {
     printf("deactivate motor\n");
+    set_stepper_pins(0,0,0,0);
     ESP_ERROR_CHECK(esp_timer_stop(periodic_timer));
-}
-
-static void task_RunMotor(void* arg)
-{
-    uint16_t motor_delay = 10;
-    struct machine_state local_state;
-    for(;;){
-        if(xSemaphoreTake(xSemaphore,portMAX_DELAY)){
-            local_state = state;
-            xSemaphoreGive(xSemaphore);
-        }else{
-            continue;
-        }
-        switch(state.active_state)
-        {
-            case STATE_OPENING:
-                motor_forward_one_tick(motor_delay);
-                break;
-            
-            case STATE_CLOSING:
-                motor_reverse_one_tick(motor_delay);
-                break;
-            
-            default:
-                motor_stop();
-        }
-        //vTaskDelay(motor_delay*4 / portTICK_PERIOD_MS);
-    }
 }
 
 static void task_ReadSwitches(void* arg)
 {
-    printf("Starting ReadSwitches() task...\n");
-        // Check upper limit switch
-        uint8_t upper_sw_status = gpio_get_level(GPIO_SW_UPPER);
-        uint8_t lower_sw_status = gpio_get_level(GPIO_SW_LOWER);
-        uint8_t control_sw_A = gpio_get_level(GPIO_SW_CTL_A);
-        uint8_t control_sw_B = gpio_get_level(GPIO_SW_CTL_B);
+    // Check upper limit switch
+    uint8_t upper_sw_status = gpio_get_level(GPIO_SW_UPPER);
+    uint8_t lower_sw_status = gpio_get_level(GPIO_SW_LOWER);
+    uint8_t control_sw_A = gpio_get_level(GPIO_SW_CTL_A);
+    uint8_t control_sw_B = gpio_get_level(GPIO_SW_CTL_B);
 
-        if(xSemaphoreTake(xSemaphore,100/portTICK_PERIOD_MS))
-        {
-            state.lower_limit_switch = lower_sw_status;
-            state.upper_limit_switch = upper_sw_status;
-            if(control_sw_A == 0)state.controller = CTRL_RAISE; 
-            if(control_sw_A != 0)state.controller = CTRL_LOWER; 
-            //if((control_sw_B == 1) && (control_sw_B == 1))state.controller = CTRL_AUTO;
-            xSemaphoreGive(xSemaphore);
-        }
+    state.lower_limit_switch = lower_sw_status;
+    state.upper_limit_switch = upper_sw_status;
+    if(control_sw_A == 0)state.controller = CTRL_RAISE; 
+    if(control_sw_B == 0)state.controller = CTRL_LOWER; 
+    //if((control_sw_B == 1) && (control_sw_B == 1))state.controller = CTRL_AUTO;
 }
 
 void print_state(struct machine_state* s)
@@ -216,55 +180,6 @@ void print_state(struct machine_state* s)
         case CTRL_UNKNOWN: printf("unknown ");break;
     }
     printf("\n");
-}
-
-static void task_ExecuteStateMachine(void* arg)
-{
-    printf("Starting State Machine...\n");
-    struct machine_state local_state;
-        // Get state
-        if(xSemaphoreTake(xSemaphore,100/portTICK_PERIOD_MS)) {
-            local_state = state;
-            // Check Mode
-            if(local_state.controller == CTRL_AUTO) {
-                //TO-DO: implement autoStateMachine();
-            } else {
-                manualStateMachine(&state);
-            }
-            print_state(&state);
-            xSemaphoreGive(xSemaphore);
-        }
-}
-
-static void manualStateMachine(struct machine_state *s)
-{
-    switch(s->active_state)
-    {
-        case STATE_OPEN:
-        if(s->controller == CTRL_LOWER)s->active_state = STATE_CLOSING;
-            break;
-
-        case STATE_CLOSING:
-        {
-            if(s->lower_limit_switch == 0)s->active_state = STATE_CLOSED;
-            if(s->controller == CTRL_RAISE)s->active_state = STATE_OPENING;
-            break;
-        }
-
-        case STATE_CLOSED:
-        if(s->controller == CTRL_RAISE)s->active_state = STATE_OPENING;
-            break;
-
-        case STATE_OPENING:
-        {
-            if(s->upper_limit_switch == 0)s->active_state = STATE_OPEN;
-            if(s->controller == CTRL_LOWER)s->active_state = STATE_CLOSING;
-            break;
-        }
-
-        default:
-        //printf("Error! Unknown state\n");
-    }
 }
 
 static void gpio_isr_handler(void* arg)
@@ -349,6 +264,7 @@ void app_main(void)
     gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
     //hook isr handler for specific gpio pin
     gpio_isr_handler_add(GPIO_SW_CTL_A, gpio_isr_handler, (void*) GPIO_SW_CTL_A);
+    gpio_isr_handler_add(GPIO_SW_CTL_B, gpio_isr_handler, (void*) GPIO_SW_CTL_B);
 
     printf("Minimum free heap size: %"PRIu32" bytes\n", esp_get_minimum_free_heap_size());
 
