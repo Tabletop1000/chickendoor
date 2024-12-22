@@ -46,7 +46,8 @@ static const char *TAG = "chickendoor";
 #define STEPPER_OUTPUT_B    16
 #define STEPPER_OUTPUT_C    12
 #define STEPPER_OUTPUT_D    14
-#define GPIO_STEPPER_PIN_SEL ((1ULL<<STEPPER_OUTPUT_A) | (1ULL<<STEPPER_OUTPUT_B) | (1ULL<<STEPPER_OUTPUT_C) | (1ULL<<STEPPER_OUTPUT_D))
+#define HBRIDGE_ENABLE    13
+#define GPIO_STEPPER_PIN_SEL ((1ULL<<STEPPER_OUTPUT_A) | (1ULL<<STEPPER_OUTPUT_B) | (1ULL<<STEPPER_OUTPUT_C) | (1ULL<<STEPPER_OUTPUT_D) | (1ULL<<HBRIDGE_ENABLE))
 
 #define GPIO_SW_UPPER   0
 #define GPIO_SW_LOWER   2
@@ -139,12 +140,14 @@ void pulse_pin(uint16_t gpio, uint16_t duration_ms)
 
 static void activate_motor()
 {
+    gpio_set_level(HBRIDGE_ENABLE,1);
     printf("activate motor\n");
     ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 2000));
 }
 
 static void deactivate_motor()
 {
+    gpio_set_level(HBRIDGE_ENABLE,0);
     printf("deactivate motor\n");
     set_stepper_pins(0,0,0,0);
     ESP_ERROR_CHECK(esp_timer_stop(periodic_timer));
