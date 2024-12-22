@@ -8,13 +8,15 @@
     },
     "idf.espIdfPathWin": "C:\\Users\\jadon\\esp\\esp-idf",
     "idf.openOcdConfigs": [
-        "board/esp32-wrover-kit-3.3v.cfg"
+        "interface/ftdi/esp32_devkitj_v1.cfg",
+        "target/esp32.cfg"
     ],
     "idf.portWin": "COM5",
     "idf.pythonBinPathWin": "C:\\Users\\jadon\\.espressif\\python_env\\idf5.1_py3.11_env\\Scripts\\python.exe",
     "idf.toolsPathWin": "C:\\Users\\jadon\\.espressif",
     "files.associations": {
-        "semphr.h": "c"
+        "semphr.h": "c",
+        "esp_sleep.h": "c"
     },
     "idf.flashType": "UART",
     "idf.espIdfPath": "/home/jdutra/esp/esp-idf",

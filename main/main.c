@@ -14,9 +14,11 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 
 /**
  * Brief:
@@ -49,8 +51,11 @@ static const char *TAG = "chickendoor";
 #define GPIO_SW_UPPER   0
 #define GPIO_SW_LOWER   2
 #define GPIO_SW_CTL_A     15
-#define GPIO_SW_CTL_B     18
-#define GPIO_SW_PIN_SEL  ((1ULL<<GPIO_SW_UPPER) | (1ULL<<GPIO_SW_LOWER) | (1ULL<<GPIO_SW_CTL_A) | (1ULL<<GPIO_SW_CTL_B))
+#define GPIO_SW_CTL_B     25
+#define GPIO_LIM_SW_PIN_SEL  ((1ULL<<GPIO_SW_UPPER) | (1ULL<<GPIO_SW_LOWER))
+#define GPIO_CTL_SW_PIN_SEL  ((1ULL<<GPIO_SW_CTL_A) | (1ULL<<GPIO_SW_CTL_B))
+
+
 
 SemaphoreHandle_t xSemaphore = NULL;
 esp_timer_handle_t periodic_timer;
@@ -118,7 +123,7 @@ static void periodic_timer_callback(void* arg)
 
 /* Task function declarations */
 static void task_RunMotor(void* arg);
-static void task_ReadSwitches(void* arg);
+static void ReadSwitches();
 static void task_ReadClock(void* arg);
 static void task_ExecuteStateMachine(void* arg);
 
@@ -145,7 +150,7 @@ static void deactivate_motor()
     ESP_ERROR_CHECK(esp_timer_stop(periodic_timer));
 }
 
-static void task_ReadSwitches(void* arg)
+static void ReadSwitches()
 {
     // Check upper limit switch
     uint8_t upper_sw_status = gpio_get_level(GPIO_SW_UPPER);
@@ -155,9 +160,10 @@ static void task_ReadSwitches(void* arg)
 
     state.lower_limit_switch = lower_sw_status;
     state.upper_limit_switch = upper_sw_status;
-    if(control_sw_A == 0)state.controller = CTRL_RAISE; 
-    if(control_sw_B == 0)state.controller = CTRL_LOWER; 
-    //if((control_sw_B == 1) && (control_sw_B == 1))state.controller = CTRL_AUTO;
+    if(control_sw_A == 1)state.controller = CTRL_RAISE; 
+    if(control_sw_B == 1)state.controller = CTRL_LOWER; 
+    if((control_sw_A == 0) && (control_sw_B == 0))state.controller = CTRL_AUTO;
+    // printf("CTL A: %d, CTL B: %d, L1: %d, L2: %d\n",control_sw_A,control_sw_B,lower_sw_status,upper_sw_status);
 }
 
 void print_state(struct machine_state* s)
@@ -182,42 +188,56 @@ void print_state(struct machine_state* s)
     printf("\n");
 }
 
-static void gpio_isr_handler(void* arg)
+static void manual_lower(void)
 {
-    uint32_t gpio_num = (uint32_t) arg;
-    gpio_intr_disable(GPIO_SW_CTL_A);
-    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+    activate_motor();
+    printf("Waiting for lower lim switch...\n");
+    while(state.lower_limit_switch){
+        ReadSwitches(NULL);
+        if(state.controller != CTRL_LOWER)
+        {
+            printf("lower action interrupted by controller\n");
+            break;
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    deactivate_motor();
 }
 
-static void gpio_task_example(void* arg)
+static void manual_raise(void)
 {
-    uint32_t io_num;
-    for (;;) {
-        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-            gpio_intr_enable(GPIO_SW_CTL_A);
-            printf("GPIO[%"PRIu32"] intr, val: %d\n", io_num, gpio_get_level(io_num));
-            task_ReadSwitches(NULL);
-
-            if(state.controller == CTRL_LOWER){
-                activate_motor();
-                while(state.lower_limit_switch){
-                    task_ReadSwitches(NULL);
-                    vTaskDelay(10 / portTICK_PERIOD_MS);
-                }
-                deactivate_motor();
-            }else if(state.controller == CTRL_RAISE){
-                activate_motor();
-                while(state.upper_limit_switch){
-                    task_ReadSwitches(NULL);
-                    vTaskDelay(100/portTICK_PERIOD_MS);
-                }
-                deactivate_motor();
-            }
-
+    activate_motor();
+    printf("Waiting for upper lim switch...\n");
+    while(state.upper_limit_switch){
+        ReadSwitches(NULL);
+        if(state.controller != CTRL_RAISE)
+        {
+            printf("raise action interrupted by controller\n");
+            break;
         }
-
+        vTaskDelay(100/portTICK_PERIOD_MS);
     }
+    deactivate_motor();
+}
+
+void set_wakeup_mode_any_high()
+{
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(GPIO_CTL_SW_PIN_SEL,ESP_EXT1_WAKEUP_ANY_HIGH));
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    rtc_gpio_pullup_dis(GPIO_SW_CTL_A);
+    rtc_gpio_pulldown_en(GPIO_SW_CTL_A);
+    rtc_gpio_pullup_dis(GPIO_SW_CTL_B);
+    rtc_gpio_pulldown_en(GPIO_SW_CTL_B);
+}
+
+void set_wakeup_mode_all_low()
+{
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(GPIO_CTL_SW_PIN_SEL,ESP_EXT1_WAKEUP_ALL_LOW));
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    rtc_gpio_pullup_dis(GPIO_SW_CTL_A);
+    rtc_gpio_pulldown_en(GPIO_SW_CTL_A);
+    rtc_gpio_pullup_dis(GPIO_SW_CTL_B);
+    rtc_gpio_pulldown_en(GPIO_SW_CTL_B);
 }
 
 void app_main(void)
@@ -234,37 +254,64 @@ void app_main(void)
     gpio_config_t io_conf = {};
     //disable interrupt
     io_conf.intr_type = GPIO_INTR_DISABLE;
-    //set as output mode
     io_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set,e.g.GPIO18/19
     io_conf.pin_bit_mask = GPIO_STEPPER_PIN_SEL;
-    //disable pull-down mode
-    io_conf.pull_down_en = 0;
-    //disable pull-up mode
     io_conf.pull_up_en = 0;
+    io_conf.pull_down_en = 0;
     //configure GPIO with the given settings
     gpio_config(&io_conf);
 
     //enable interrupt
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;
-    //bit mask of the pins, use GPIO4/5 here
-    io_conf.pin_bit_mask = GPIO_SW_PIN_SEL;
-    //set as input mode
+    io_conf.intr_type = GPIO_INTR_POSEDGE;
     io_conf.mode = GPIO_MODE_INPUT;
-    //enable pull-up mode
+    io_conf.pin_bit_mask = GPIO_CTL_SW_PIN_SEL;
+    io_conf.pull_up_en = 0;
+    io_conf.pull_down_en = 1;
+    gpio_config(&io_conf);
+
+    //enable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = GPIO_LIM_SW_PIN_SEL;
     io_conf.pull_up_en = 1;
+    io_conf.pull_down_en = 0;
     gpio_config(&io_conf);
 
 
-    //create a queue to handle gpio event from isr
-    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
-    xTaskCreate(&gpio_task_example, "gpiotask" , 2048, NULL, 5, NULL);
+    
 
-    //install gpio isr service
-    gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
-    //hook isr handler for specific gpio pin
-    gpio_isr_handler_add(GPIO_SW_CTL_A, gpio_isr_handler, (void*) GPIO_SW_CTL_A);
-    gpio_isr_handler_add(GPIO_SW_CTL_B, gpio_isr_handler, (void*) GPIO_SW_CTL_B);
+    while(1)
+    {
+        vTaskDelay(200 / portTICK_PERIOD_MS); // debounce delay
+        ReadSwitches();
+        print_state(&state);
+        // If we are in manual open or manual close, wake on all low (center pos)
+        switch (state.controller)
+        {
+            case CTRL_LOWER:
+                printf("Detected state: manual lower\n");
+                set_wakeup_mode_all_low();
+                manual_lower();
+                break;
+            case CTRL_RAISE:
+                printf("Detected state: manual raise\n");
+                set_wakeup_mode_all_low();
+                manual_raise();
+                break;
+            case CTRL_AUTO:
+                printf("Detected state: auto\n");
+                set_wakeup_mode_any_high();
+                break;
+            default:
+                printf("undefined controller state\n");
+                break;
+        }
+
+        printf("finished door control. entering sleep..\n");
+        esp_deep_sleep_start();
+        esp_wake_deep_sleep();
+        printf("woke from sleep\n");
+    }
 
     printf("Minimum free heap size: %"PRIu32" bytes\n", esp_get_minimum_free_heap_size());
 
@@ -273,8 +320,5 @@ void app_main(void)
     {
         printf("Error creating semaphore\n");
     }
-    state.active_state = STATE_OPENING;
-    // xTaskCreate(&task_RunMotor, "RunMotor", 2048, NULL, 5, NULL);
-    // xTaskCreate(&task_ReadSwitches, "ReadSwitches", 2048, NULL, 5, NULL);
-    // xTaskCreate(&task_ExecuteStateMachine, "ExecuteStateMachine", 2048, NULL, 5, NULL);
+    state.active_state = STATE_UNKNOWN;
 }
