@@ -142,7 +142,7 @@ static void activate_motor()
 {
     gpio_set_level(HBRIDGE_ENABLE,1);
     printf("activate motor\n");
-    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 2000));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 6000));
 }
 
 static void deactivate_motor()
