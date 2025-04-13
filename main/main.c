@@ -243,6 +243,28 @@ void set_wakeup_mode_all_low()
     rtc_gpio_pulldown_en(GPIO_SW_CTL_B);
 }
 
+typedef struct  {
+    int door_open_time;
+    int door_close_time;
+}timetable_t;
+
+static const timetable_t timetable = {
+    .door_open_time = 07,
+    .door_close_time = 20,
+};
+
+static void deep_sleep_register_rtc_timer_wakeup(int hours)
+{
+    int wakeup_time_sec = hours * 60 * 60;
+    printf("Enabling timer wakeup, %ds\n", wakeup_time_sec);
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(wakeup_time_sec * 1000000));
+}
+
+int get_timetable_state()
+{
+    
+}
+
 void app_main(void)
 {
     const esp_timer_create_args_t periodic_timer_args = {
@@ -281,13 +303,14 @@ void app_main(void)
     gpio_config(&io_conf);
 
 
-    
+
 
     while(1)
     {
         vTaskDelay(200 / portTICK_PERIOD_MS); // debounce delay
         ReadSwitches();
         print_state(&state);
+        int current_time = 0;
         // If we are in manual open or manual close, wake on all low (center pos)
         switch (state.controller)
         {
@@ -303,6 +326,20 @@ void app_main(void)
                 break;
             case CTRL_AUTO:
                 printf("Detected state: auto\n");
+                // check door state.
+                    if(current_time > timetable.door_open_time &&
+                        current_time < timetable.door_close_time){
+                            if(state.upper_limit_switch == 0U) { // door is open
+                                manual_raise();
+                            }
+                        }else {
+                            if(state.lower_limit_switch == 0U) {
+                                manual_lower();
+                            }
+                        }
+                }
+                // check the timetable
+                // match to the door to the timetable
                 set_wakeup_mode_any_high();
                 break;
             default:
